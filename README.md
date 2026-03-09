@@ -53,6 +53,18 @@ Alternatively you can define the location of the config file with the `--config`
 staleaudit-for-plex --config=/path/to/config.json
 ```
 
+To write all stale results across all libraries to a CSV file instead of opening the interactive UI:
+
+```bash
+staleaudit-for-plex --output=/path/to/stale-results.csv
+```
+
+You can combine both flags when you want a custom config location and CSV output:
+
+```bash
+staleaudit-for-plex --config=/path/to/config.json --output=/path/to/stale-results.csv
+```
+
 Use the ARROW and ENTER keys on your keyboard to choose a library, and then the ARROW keys to scroll up/down.
 
 USE CTRL-C or Q to exit.

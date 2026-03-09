@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -89,6 +90,23 @@ type LocalConfig struct {
 	Language                  string `json:"language" default:"en"`
 }
 
+type LibrarySummary struct {
+	ID     int
+	Name   string
+	SizeGB float64
+}
+
+type StaleResult struct {
+	LibraryID     int
+	LibraryName   string
+	MetadataID    int
+	Title         string
+	SizeGB        float64
+	BitrateMbps   float64
+	Created       string
+	LastStreamed  string
+}
+
 type Model struct {
 	page     Page
 	selected int // which to-do items are selected
@@ -116,24 +134,24 @@ func sqliteReadOnlyDSN(dbPath string) string {
 
 func main() {
 	VERBOSE = false
-	// if there is a command line argument for --config=, pass that into loadConfig:
 	CONFIG = LocalConfig{}
+	var configPath string
+	var outputPath string
+
 	if len(os.Args) > 1 {
 		for _, arg := range os.Args[1:] {
 			if strings.HasPrefix(arg, "--config=") {
-				configPath := strings.TrimPrefix(arg, "--config=")
-				// load the config from the file
-				loadConfig(configPath)
+				configPath = strings.TrimPrefix(arg, "--config=")
+			} else if strings.HasPrefix(arg, "--output=") {
+				outputPath = strings.TrimPrefix(arg, "--output=")
 			} else {
 				fmt.Println("Error: Unrecognized argument: ", arg)
-				fmt.Println("Usage: staleaudit-for-plex --config=<path to config file>")
+				fmt.Println("Usage: staleaudit-for-plex [--config=<path to config file>] [--output=<path to csv file>]")
 				os.Exit(1)
 			}
 		}
-	} else {
-		// load the config from the default location
-		loadConfig("")
 	}
+	loadConfig(configPath)
 
 	MODEL := Model{table: table.Model{}, selected: 0, err: nil}
 
@@ -159,6 +177,14 @@ func main() {
 
 	MODEL.db = db
 	MODEL.printer = message.NewPrinter(message.MatchLanguage(CONFIG.Language))
+
+	if outputPath != "" {
+		if err := MODEL.exportAllLibrariesToCSV(outputPath); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("Wrote CSV to " + outputPath)
+		return
+	}
 
 	MODEL.prepareLibraryPickerPage()
 	if _, err := tea.NewProgram(MODEL).Run(); err != nil {
@@ -260,30 +286,48 @@ func loadConfig(configLocationInput string) {
 	}
 }
 
-func (m *Model) prepareLibraryPickerPage() {
-	tableRows := []table.Row{}
-
+func (m *Model) listLibraries() ([]LibrarySummary, error) {
+	libraries := []LibrarySummary{}
 	rows, err := m.db.Query("SELECT library_section_id, name, sum(size) as s FROM media_items INNER JOIN library_sections ls ON ls.id = library_section_id WHERE deleted_at IS NULL AND library_section_id > 0 GROUP BY library_section_id ORDER BY s DESC")
 	if err != nil {
-		log.Fatalln("DB location: " + CONFIG.PlexDBPath)
-		log.Fatal("Media Items query:" + err.Error())
+		return nil, fmt.Errorf("media items query: %w", err)
 	}
 	defer rows.Close()
-	// Iterate through the rows
 	for rows.Next() {
 		var library_section_id int
 		var name string
 		var size float64
 		err := rows.Scan(&library_section_id, &name, &size)
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
-		sizeInGb := m.printer.Sprintf("%.2f", size/1000.00/1000.00/1000.00)
-		m.maxLibraryNameLength = math.Max(m.maxLibraryNameLength, float64(len(name)))
+		libraries = append(libraries, LibrarySummary{
+			ID:     library_section_id,
+			Name:   name,
+			SizeGB: size / 1000.00 / 1000.00 / 1000.00,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return libraries, nil
+}
+
+func (m *Model) prepareLibraryPickerPage() {
+	tableRows := []table.Row{}
+
+	libraries, err := m.listLibraries()
+	if err != nil {
+		log.Fatalln("DB location: " + CONFIG.PlexDBPath)
+		log.Fatal(err)
+	}
+	m.maxLibraryNameLength = 0
+	for _, library := range libraries {
+		m.maxLibraryNameLength = math.Max(m.maxLibraryNameLength, float64(len(library.Name)))
 		tableRows = append(tableRows, table.Row{
-			fmt.Sprintf("%d", library_section_id),
-			name,
-			sizeInGb,
+			fmt.Sprintf("%d", library.ID),
+			library.Name,
+			m.printer.Sprintf("%.2f", library.SizeGB),
 		})
 	}
 
@@ -316,28 +360,14 @@ func (m *Model) prepareLibraryPickerPage() {
 
 }
 
-func (m *Model) prepareLibraryViewPage() {
-
-	//  select size from media_items inner join metadata_items mi on media_items.metadata_item_id = mi.id where size > 0;
-	// media_items has size, and binds to metadata_item_id.
-	// Once it's to metadata_items, we can remove items that exist in metadata_item_views
-
-	// SELECT mi.title, sum(size) / 1024 / 1024 /1024 FROM media_items INNER JOIN metadata_items mi ON media_items.metadata_item_id = mi.id WHERE size > 0 AND media_items.library_section_id = 3 AND mi.guid NOT IN (SELECT guid FROM metadata_item_views) GROUP BY title order by sum(size) desc;
-	// ^ TODO: this needs to group children to the parent
-
-	// SO:
-	// Populate a list of all the top-level items in the library:
+func (m *Model) collectStaleResults(library LibrarySummary) ([]StaleResult, error) {
 	query := "SELECT guid, metadata_items.id, title, metadata_items.created_at, coalesce(size,0), coalesce(bitrate, 0) FROM metadata_items LEFT JOIN media_items on media_items.metadata_item_id = metadata_items.id WHERE metadata_items.guid not like 'collection://%' AND parent_id is null and metadata_items.library_section_id = ?;"
-	rows, err := m.db.Query(query, m.libraryID)
+	rows, err := m.db.Query(query, library.ID)
 	if err != nil {
-		log.Fatal("MetadataItems query: " + err.Error())
+		return nil, fmt.Errorf("metadata items query: %w", err)
 	}
-	defer rows.Close()
-	// Iterate through the rows
-
 	libraryItems := make(map[string]LibraryItem)
 	idToGuidMap := make(map[int]string)
-	duplicateGuids := make(map[string]int)
 	for rows.Next() {
 		var id int
 		var title string
@@ -347,10 +377,10 @@ func (m *Model) prepareLibraryViewPage() {
 		var bitrate float64
 		err := rows.Scan(&guid, &id, &title, &createdAt, &size, &bitrate)
 		if err != nil {
-			log.Fatal(err)
+			rows.Close()
+			return nil, err
 		}
 		if libraryItems[guid].MetadataID != 0 {
-			duplicateGuids[guid]++
 			item := libraryItems[guid]
 			item.TotalSize += size
 			item.CreatedAt = math.Min(item.CreatedAt, createdAt)
@@ -360,18 +390,20 @@ func (m *Model) prepareLibraryViewPage() {
 
 		idToGuidMap[id] = guid
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 
-	// for children, we need to sum the media and update the parent
-	// start by getting all the seasons
 	allSeasons := make(map[int]LibraryItemSeason)
 	query = "select season.parent_id, season.id, season.title, sum(size) as size, count(1) as count, avg(bitrate) as avgbitrate FROM media_items INNER JOIN metadata_items episode ON  media_items.metadata_item_id = episode.id INNER JOIN metadata_items season ON season.id = episode.parent_id WHERE episode.library_section_id = ? GROUP BY season.id;"
-	rows, err = m.db.Query(query, m.libraryID)
+	rows, err = m.db.Query(query, library.ID)
 	if err != nil {
-		log.Fatal("Views Query: " + err.Error())
+		return nil, fmt.Errorf("children size query: %w", err)
 	}
-	defer rows.Close()
-	// Iterate through the rows
-
 	for rows.Next() {
 		var parentID int
 		var seasonID int
@@ -381,30 +413,31 @@ func (m *Model) prepareLibraryViewPage() {
 		var avgBitrate float64
 		err := rows.Scan(&parentID, &seasonID, &title, &size, &count, &avgBitrate)
 		if err != nil {
-			log.Fatal("Children size counting: " + err.Error())
+			rows.Close()
+			return nil, fmt.Errorf("children size counting: %w", err)
 		}
-
 		allSeasons[seasonID] = LibraryItemSeason{Title: title, TotalSize: size, MetadataID: seasonID, ParentID: parentID, NumberChildren: count, AvgBitrate: avgBitrate}
-		l := libraryItems[idToGuidMap[parentID]]
+		parentGUID := idToGuidMap[parentID]
+		l := libraryItems[parentGUID]
 		l.TotalSize += size
 		l.Seasons = append(l.Seasons, allSeasons[seasonID])
 		l.Bitrate = avgBitrate
-		libraryItems[idToGuidMap[parentID]] = l
+		libraryItems[parentGUID] = l
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
 	}
 
-	// add view information
 	query = "SELECT grandparent_guid, coalesce(size, 0), miv.guid, coalesce(parent_id, 0), miv.viewed_at FROM metadata_item_views as miv INNER JOIN metadata_items mi ON mi.guid = miv.guid LEFT JOIN media_items on media_items.metadata_item_id = mi.id WHERE grandparent_guid is not null and mi.library_section_id = ? and miv.viewed_at > 0 ORDER BY miv.viewed_at ASC;"
-	rows, err = m.db.Query(query, m.libraryID)
+	rows, err = m.db.Query(query, library.ID)
 	if err != nil {
-		log.Fatal("Views Query: " + err.Error())
+		return nil, fmt.Errorf("views query: %w", err)
 	}
-	defer rows.Close()
-	// Iterate through the rows
-
-	var oldestView float64
-	var newestView float64
 	for rows.Next() {
-
 		var guid string
 		var parentID int
 		var size int64
@@ -412,13 +445,9 @@ func (m *Model) prepareLibraryViewPage() {
 		var viewedAt float64
 		err := rows.Scan(&grandparentGuid, &size, &guid, &parentID, &viewedAt)
 		if err != nil {
-			log.Fatal(err)
+			rows.Close()
+			return nil, err
 		}
-
-		if oldestView == 0 {
-			oldestView = viewedAt
-		}
-		newestView = viewedAt
 
 		if grandparentGuid != "" {
 			guid = grandparentGuid
@@ -430,12 +459,15 @@ func (m *Model) prepareLibraryViewPage() {
 		item.LastWatched = math.Max(viewedAt, item.LastWatched)
 		libraryItems[guid] = item
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
 
-	// filter by created and last watched to get the decaying rows
-	decayingRows := make([]table.Row, 0)
-
-	// make a unix epoch timestamp for 18 months prior:
-	// 18 months = 18 * 30 * 24 * 60 * 60 = 15552000
+	results := make([]StaleResult, 0)
 	createdLongAgo := float64(time.Now().AddDate(0, -1*CONFIG.FilterCreatedBeforeMonths, 0).Unix())
 	lastStreamedLongAgo := float64(time.Now().AddDate(0, -1*CONFIG.FilterLastStreamedMonths, 0).Unix())
 	for _, item := range libraryItems {
@@ -448,42 +480,51 @@ func (m *Model) prepareLibraryViewPage() {
 			if item.LastWatched > 1000000 {
 				lastWatchedStr = time.Unix(int64(item.LastWatched), 0).Format("2006-01-02")
 			}
-
-			decayingRows = append(decayingRows, table.Row{
-				fmt.Sprintf("%d", item.MetadataID),
-				item.Title,
-				m.printer.Sprintf("%.2f", float64(item.TotalSize)/1000.00/1000.00/1000.00),
-				m.printer.Sprintf("%.1f", item.Bitrate/1000.0/1000.0),
-				time.Unix(int64(item.CreatedAt), 0).Format("2006-01-02"),
-				lastWatchedStr,
+			results = append(results, StaleResult{
+				LibraryID:    library.ID,
+				LibraryName:  library.Name,
+				MetadataID:   item.MetadataID,
+				Title:        item.Title,
+				SizeGB:       float64(item.TotalSize) / 1000.00 / 1000.00 / 1000.00,
+				BitrateMbps:  item.Bitrate / 1000.0 / 1000.0,
+				Created:      time.Unix(int64(item.CreatedAt), 0).Format("2006-01-02"),
+				LastStreamed: lastWatchedStr,
 			})
-		} else {
-			//color.Green("%s %d", item.Title, item.NumberStreams)
 		}
 	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].SizeGB > results[j].SizeGB
+	})
+	return results, nil
+}
 
-	// format oldestView from a unixepoch timestamp to a date
+func (m *Model) prepareLibraryViewPage() {
+	results, err := m.collectStaleResults(LibrarySummary{ID: m.libraryID})
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	oldestViewStr := time.Unix(int64(oldestView), 0).Format("2006-01-02")
-	newestViewStr := time.Unix(int64(newestView), 0).Format("2006-01-02")
-
-	_, _ = oldestViewStr, newestViewStr
-
+	decayingRows := make([]table.Row, 0, len(results))
+	maxTitleLength := 25.0
+	for _, result := range results {
+		maxTitleLength = math.Max(maxTitleLength, float64(len(result.Title)))
+		decayingRows = append(decayingRows, table.Row{
+			fmt.Sprintf("%d", result.MetadataID),
+			result.Title,
+			m.printer.Sprintf("%.2f", result.SizeGB),
+			m.printer.Sprintf("%.1f", result.BitrateMbps),
+			result.Created,
+			result.LastStreamed,
+		})
+	}
 	tableColumns := []table.Column{
 		{Title: "ID", Width: 10},
-		{Title: "Name", Width: int(math.Max(25, math.Min(50, m.maxLibraryNameLength)))},
+		{Title: "Name", Width: int(math.Max(25, math.Min(50, maxTitleLength)))},
 		{Title: "Size (Gb)", Width: 15},
 		{Title: "Bitrate (Mb/s)", Width: 15},
 		{Title: "Created", Width: 12},
 		{Title: "Last Streamed", Width: 15},
 	}
-
-	// sort decayingRows by size descending
-	sort.Slice(decayingRows, func(i, j int) bool {
-		sizeI, _ := strconv.ParseFloat(decayingRows[i][2], 64)
-		sizeJ, _ := strconv.ParseFloat(decayingRows[j][2], 64)
-		return sizeI > sizeJ
-	})
 
 	decayingTable := table.New(
 		table.WithColumns(tableColumns),
@@ -505,6 +546,57 @@ func (m *Model) prepareLibraryViewPage() {
 	decayingTable.SetStyles(s)
 
 	m.table = decayingTable
+}
+
+func (m *Model) exportAllLibrariesToCSV(outputPath string) error {
+	libraries, err := m.listLibraries()
+	if err != nil {
+		return err
+	}
+
+	outputDir := filepath.Dir(outputPath)
+	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
+		return fmt.Errorf("output directory does not exist: %s", outputDir)
+	}
+
+	outputFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("error opening output %s: %w", outputPath, err)
+	}
+	defer outputFile.Close()
+
+	writer := csv.NewWriter(outputFile)
+	defer writer.Flush()
+
+	if err := writer.Write([]string{"library_id", "library_name", "metadata_id", "title", "size_gb", "bitrate_mbps", "created", "last_streamed"}); err != nil {
+		return err
+	}
+
+	for _, library := range libraries {
+		results, err := m.collectStaleResults(library)
+		if err != nil {
+			return err
+		}
+		for _, result := range results {
+			if err := writer.Write([]string{
+				strconv.Itoa(result.LibraryID),
+				result.LibraryName,
+				strconv.Itoa(result.MetadataID),
+				result.Title,
+				fmt.Sprintf("%.2f", result.SizeGB),
+				fmt.Sprintf("%.1f", result.BitrateMbps),
+				result.Created,
+				result.LastStreamed,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := writer.Error(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // how to: api call for optimize media.
