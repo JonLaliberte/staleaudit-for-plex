@@ -3,9 +3,12 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -101,6 +104,16 @@ type Model struct {
 var CONFIG LocalConfig
 var VERBOSE bool
 
+func sqliteReadOnlyDSN(dbPath string) string {
+	dsn := &url.URL{Scheme: "file", Path: dbPath}
+	query := dsn.Query()
+	query.Set("mode", "ro")
+	query.Set("immutable", "1")
+	query.Set("_query_only", "1")
+	dsn.RawQuery = query.Encode()
+	return dsn.String()
+}
+
 func main() {
 	VERBOSE = false
 	// if there is a command line argument for --config=, pass that into loadConfig:
@@ -135,8 +148,11 @@ func main() {
 
 	// Connect to the Plex sqlite server
 
-	db, err := sql.Open("sqlite3", CONFIG.PlexDBPath)
+	db, err := sql.Open("sqlite3", sqliteReadOnlyDSN(CONFIG.PlexDBPath))
 	if err != nil {
+		log.Fatal(err)
+	}
+	if err := db.Ping(); err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
@@ -156,7 +172,6 @@ func loadConfig(configLocationInput string) {
 	var configLocation string
 	var plexRoot string
 	slash := string(os.PathSeparator)
-	var configFh *os.File
 	opsys := runtime.GOOS
 	if VERBOSE {
 		fmt.Println("OS: " + opsys)
@@ -190,24 +205,23 @@ func loadConfig(configLocationInput string) {
 
 	if _, err := os.Stat(configLocation); os.IsNotExist(err) {
 		fmt.Println("Creating a new config...")
-		configFh, err = os.Create(configLocation)
-		if err != nil {
-			panic(err)
-		}
-		defer configFh.Close()
 	} else {
 		if VERBOSE {
 			fmt.Println("Using an existing config...")
 		}
 		// Load the existing file.
-		configFh, err = os.Open(configLocation)
+		configFh, err := os.Open(configLocation)
 		if err != nil {
-			panic(err)
+			log.Fatalf("Error opening config %s: %v", configLocation, err)
 		}
-		defer configFh.Close()
-
 		decoder := json.NewDecoder(configFh)
-		decoder.Decode(&CONFIG)
+		if err := decoder.Decode(&CONFIG); err != nil && !errors.Is(err, io.EOF) {
+			_ = configFh.Close()
+			log.Fatalf("Error decoding config %s: %v", configLocation, err)
+		}
+		if err := configFh.Close(); err != nil {
+			log.Fatalf("Error closing config %s: %v", configLocation, err)
+		}
 	}
 
 	if CONFIG.PlexDBPath == "" {
@@ -223,8 +237,21 @@ func loadConfig(configLocationInput string) {
 		CONFIG.FilterLastStreamedMonths = 18
 	}
 
+	configFh, err := os.OpenFile(configLocation, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		log.Fatalf("Error opening config %s for writing: %v", configLocation, err)
+	}
+	defer configFh.Close()
+
 	encoder := json.NewEncoder(configFh)
-	encoder.Encode(&CONFIG)
+	if err := encoder.Encode(&CONFIG); err != nil {
+		log.Fatalf("Error encoding config %s: %v", configLocation, err)
+	}
+	if opsys != "windows" {
+		if err := os.Chmod(configLocation, 0o600); err != nil {
+			log.Fatalf("Error setting config permissions on %s: %v", configLocation, err)
+		}
+	}
 
 	if VERBOSE {
 		fmt.Println("Using config at " + configLocation)
