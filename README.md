@@ -33,6 +33,10 @@ go install github.com/pnwmatt/staleaudit-for-plex@latest
 
 Visit https://github.com/pnwmatt/staleaudit-for-plex/releases
 
+## Releasing
+
+Push a version tag such as `v0.1.0` and GitHub Actions will build a Linux x86_64 release archive, then attach it to a GitHub Release.
+
 ## Usage
 
 On the server running Plex, simply run the command:

@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
+  build-and-upload:
+    needs: create-release
+    runs-on: ubuntu-latest
+
+    env:
+      CGO_ENABLED: 1
+      GOOS: linux
+      GOARCH: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Build Linux archive
+        run: |
+          mkdir -p dist/package
+          go build -o "dist/package/staleaudit-for-plex" .
+          cp README.md LICENSE dist/package/
+          tar -C dist/package -czf "staleaudit-for-plex_Linux_x86_64.tar.gz" .
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: staleaudit-for-plex_Linux_x86_64.tar.gz
+          overwrite_files: true
