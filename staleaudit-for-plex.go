@@ -105,6 +105,7 @@ type StaleResult struct {
 	BitrateMbps   float64
 	Created       string
 	LastStreamed  string
+	FilePaths     string
 }
 
 type Model struct {
@@ -398,6 +399,45 @@ func (m *Model) collectStaleResults(library LibrarySummary) ([]StaleResult, erro
 		return nil, err
 	}
 
+	pathsByMetadataID := make(map[int][]string)
+	query = "SELECT coalesce(metadata_items.grandparent_id, metadata_items.parent_id, metadata_items.id) as top_level_id, media_parts.file FROM media_parts INNER JOIN media_items ON media_parts.media_item_id = media_items.id INNER JOIN metadata_items ON media_items.metadata_item_id = metadata_items.id WHERE metadata_items.library_section_id = ? AND media_parts.file IS NOT NULL AND media_parts.file != '';"
+	rows, err = m.db.Query(query, library.ID)
+	if err != nil {
+		return nil, fmt.Errorf("media paths query: %w", err)
+	}
+	for rows.Next() {
+		var metadataID int
+		var mediaFile string
+		err := rows.Scan(&metadataID, &mediaFile)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		parentPath := filepath.Clean(filepath.Dir(mediaFile))
+		existingPaths := pathsByMetadataID[metadataID]
+		alreadyPresent := false
+		for _, existingPath := range existingPaths {
+			if existingPath == parentPath {
+				alreadyPresent = true
+				break
+			}
+		}
+		if !alreadyPresent {
+			pathsByMetadataID[metadataID] = append(pathsByMetadataID[metadataID], parentPath)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for metadataID, paths := range pathsByMetadataID {
+		sort.Strings(paths)
+		pathsByMetadataID[metadataID] = paths
+	}
+
 	allSeasons := make(map[int]LibraryItemSeason)
 	query = "select season.parent_id, season.id, season.title, sum(size) as size, count(1) as count, avg(bitrate) as avgbitrate FROM media_items INNER JOIN metadata_items episode ON  media_items.metadata_item_id = episode.id INNER JOIN metadata_items season ON season.id = episode.parent_id WHERE episode.library_section_id = ? GROUP BY season.id;"
 	rows, err = m.db.Query(query, library.ID)
@@ -489,6 +529,7 @@ func (m *Model) collectStaleResults(library LibrarySummary) ([]StaleResult, erro
 				BitrateMbps:  item.Bitrate / 1000.0 / 1000.0,
 				Created:      time.Unix(int64(item.CreatedAt), 0).Format("2006-01-02"),
 				LastStreamed: lastWatchedStr,
+				FilePaths:    strings.Join(pathsByMetadataID[item.MetadataID], "; "),
 			})
 		}
 	}
@@ -568,7 +609,7 @@ func (m *Model) exportAllLibrariesToCSV(outputPath string) error {
 	writer := csv.NewWriter(outputFile)
 	defer writer.Flush()
 
-	if err := writer.Write([]string{"library_id", "library_name", "metadata_id", "title", "size_gb", "bitrate_mbps", "created", "last_streamed"}); err != nil {
+	if err := writer.Write([]string{"library_id", "library_name", "metadata_id", "title", "size_gb", "bitrate_mbps", "created", "last_streamed", "file_paths"}); err != nil {
 		return err
 	}
 
@@ -587,6 +628,7 @@ func (m *Model) exportAllLibrariesToCSV(outputPath string) error {
 				fmt.Sprintf("%.1f", result.BitrateMbps),
 				result.Created,
 				result.LastStreamed,
+				result.FilePaths,
 			}); err != nil {
 				return err
 			}

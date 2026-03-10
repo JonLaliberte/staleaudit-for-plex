@@ -59,6 +59,8 @@ To write all stale results across all libraries to a CSV file instead of opening
 staleaudit-for-plex --output=/path/to/stale-results.csv
 ```
 
+The CSV includes a `file_paths` column containing the parent directories for the matching media files. If Plex stores an item across multiple directories, those paths are joined into the same column.
+
 You can combine both flags when you want a custom config location and CSV output:
 
 ```bash
