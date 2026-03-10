@@ -400,7 +400,7 @@ func (m *Model) collectStaleResults(library LibrarySummary) ([]StaleResult, erro
 	}
 
 	pathsByMetadataID := make(map[int][]string)
-	query = "SELECT coalesce(metadata_items.grandparent_id, metadata_items.parent_id, metadata_items.id) as top_level_id, media_parts.file FROM media_parts INNER JOIN media_items ON media_parts.media_item_id = media_items.id INNER JOIN metadata_items ON media_items.metadata_item_id = metadata_items.id WHERE metadata_items.library_section_id = ? AND media_parts.file IS NOT NULL AND media_parts.file != '';"
+	query = "SELECT coalesce(parent.parent_id, metadata_items.parent_id, metadata_items.id) as top_level_id, media_parts.file FROM media_parts INNER JOIN media_items ON media_parts.media_item_id = media_items.id INNER JOIN metadata_items ON media_items.metadata_item_id = metadata_items.id LEFT JOIN metadata_items parent ON metadata_items.parent_id = parent.id WHERE metadata_items.library_section_id = ? AND media_parts.file IS NOT NULL AND media_parts.file != '';"
 	rows, err = m.db.Query(query, library.ID)
 	if err != nil {
 		return nil, fmt.Errorf("media paths query: %w", err)
