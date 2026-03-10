@@ -123,6 +123,25 @@ type Model struct {
 var CONFIG LocalConfig
 var VERBOSE bool
 
+func shellEscapePath(path string) string {
+	var builder strings.Builder
+	for _, ch := range path {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') {
+			builder.WriteRune(ch)
+			continue
+		}
+
+		switch ch {
+		case '/', '.', '_', '-', ':', '+':
+			builder.WriteRune(ch)
+		default:
+			builder.WriteRune('\\')
+			builder.WriteRune(ch)
+		}
+	}
+	return builder.String()
+}
+
 func sqliteReadOnlyDSN(dbPath string) string {
 	dsn := &url.URL{Scheme: "file", Path: dbPath}
 	query := dsn.Query()
@@ -529,7 +548,13 @@ func (m *Model) collectStaleResults(library LibrarySummary) ([]StaleResult, erro
 				BitrateMbps:  item.Bitrate / 1000.0 / 1000.0,
 				Created:      time.Unix(int64(item.CreatedAt), 0).Format("2006-01-02"),
 				LastStreamed: lastWatchedStr,
-				FilePaths:    strings.Join(pathsByMetadataID[item.MetadataID], "; "),
+				FilePaths:    strings.Join(func(paths []string) []string {
+					escaped := make([]string, 0, len(paths))
+					for _, path := range paths {
+						escaped = append(escaped, shellEscapePath(path))
+					}
+					return escaped
+				}(pathsByMetadataID[item.MetadataID]), " "),
 			})
 		}
 	}
